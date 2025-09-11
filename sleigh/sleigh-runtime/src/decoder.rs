@@ -17,6 +17,9 @@ pub struct Decoder {
     /// The local context value.
     pub(crate) context: u64,
 
+    /// The future context modifications (Addr, Field, Val).
+    future_context_mods: Vec<(u64, Field, i64)>,
+
     /// The bytes in the instruction stream.
     bytes: Vec<u8>,
 
@@ -60,6 +63,7 @@ impl Decoder {
         Self {
             global_context: 0,
             context: 0,
+            future_context_mods: Vec::new(),
             bytes: Vec::new(),
             big_endian: false,
             allow_backtracking: true,
@@ -85,6 +89,14 @@ impl Decoder {
     /// Decode the current instruction storing the result in `inst`.
     pub fn decode_into(&mut self, sleigh: &SleighData, inst: &mut Instruction) -> Option<()> {
         self.is_valid = true;
+
+        // Apply global set modifications if instruction address matches
+        for (addr, field, val) in self.future_context_mods.iter() {
+            if *addr == self.base_addr {
+                field.set(&mut self.context, *val);
+                field.set(&mut self.global_context, *val);
+            }
+        }
 
         // Clear any noflow fields from `global_context`
         for entry in sleigh.context_fields.iter().filter(|entry| !entry.flow) {
@@ -204,9 +216,25 @@ impl Decoder {
                     let value = self.eval_context_expr(*expr, sleigh);
                     field.set(&mut self.context, value);
                 }
-                DecodeAction::SaveContext(field) => {
+                DecodeAction::SaveContext(field, expr) => {
                     let value = field.extract(self.context);
-                    field.set(&mut self.global_context, value);
+                    let addr = self.eval_context_expr(*expr, sleigh);
+                    tracing::trace!(
+                        "Saving context at 0x{:X} with value {}. PC is currently 0x{:X}.",
+                        addr, value, self.base_addr);
+
+                    // Modify global_context directly if change should take effect immediately.
+                    // Otherwise, store it for the future modification.
+                    if addr == self.base_addr as i64 {
+                        field.set(&mut self.global_context, value);
+                    }
+                    else if let Some(existing) = self.future_context_mods.iter_mut()
+                        .find(|(_, existing_field, _)| *existing_field == *field) {
+                        *existing = (addr as u64, *field, value);
+                    }
+                    else {
+                        self.future_context_mods.push((addr as u64, *field, value));
+                    }
                 }
                 DecodeAction::Eval(idx, kind) => {
                     ctx.locals_mut()[*idx as usize] = match kind {
@@ -221,6 +249,7 @@ impl Decoder {
                         // backtracking, then exit here and backtrack. If backtracking is disabled,
                         // then this must be an invalid instruction, but we continue with decoding
                         // to provide a partial decoding for debugging.
+                        tracing::error!("This is an invalid instruction!");
                         return None;
                     }
                     ctx.subtables_mut()[*idx as usize] = constructor;
@@ -586,6 +615,7 @@ pub enum ContextModValue {
     TokenField(Token, Field),
     ContextField(Field),
     InstStart,
+    InstNext,
 }
 
 impl EvalPatternValue for &'_ Decoder {
@@ -596,6 +626,12 @@ impl EvalPatternValue for &'_ Decoder {
             ContextModValue::ContextField(field) => field.extract(self.context),
             ContextModValue::TokenField(token, field) => field.extract(self.get_token(*token)),
             ContextModValue::InstStart => self.base_addr as i64,
+            // NOTE: self.next_state is still zero when this is called so we just set InstNext to
+            // InstStart. Since the context field already has to be modified locally for that
+            // instruction, this should have no effect.
+            // @todo: Should context evaluation be moved to the post_decode_actions so that
+            // next_offset is known?
+            ContextModValue::InstNext => self.base_addr as i64,
         }
     }
 }

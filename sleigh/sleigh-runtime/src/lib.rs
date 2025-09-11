@@ -275,7 +275,7 @@ pub enum DecodeAction {
     ModifyContext(Field, PatternExprRange),
 
     /// Globally saves a context value.
-    SaveContext(Field),
+    SaveContext(Field, PatternExprRange),
 
     /// Evaluate the current value of a field and store it into a local.
     Eval(LocalIndex, EvalKind),
