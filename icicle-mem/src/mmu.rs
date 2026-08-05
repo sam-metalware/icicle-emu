@@ -38,6 +38,10 @@ pub trait ReadAfterHook {
     fn read(&mut self, mem: &mut Mmu, addr: u64, value: &[u8]);
 }
 
+impl ReadAfterHook for () {
+    fn read(&mut self, _: &mut Mmu, _: u64, _: &[u8]) {}
+}
+
 pub trait WriteHook {
     fn write(&mut self, mem: &mut Mmu, addr: u64, value: &[u8]);
 }
@@ -122,14 +126,22 @@ macro_rules! active_hooks {
         if !$list.hooks.is_empty() {
             let addr = $addr;
             let mut hooks = std::mem::take(&mut $list.hooks);
-            for hook in &mut hooks {
-                if let Some(handler) = hook.handler.as_deref_mut() {
-                    if hook.start <= addr && addr < hook.end {
-                        ($action)(handler);
+            let original_len = hooks.len();
+            for i in 0..original_len {
+                let hook = &mut hooks[i];
+                if hook.handler.is_some() && hook.start <= addr && addr < hook.end {
+                    // Temporarily take the handler out to avoid borrow conflicts.
+                    let mut handler = hook.handler.replace(Box::new(())).unwrap();
+                    // Put the hooks back so add_write_hook/remove_write_hook
+                    // operate on the full list with correct indices.
+                    $list.hooks = hooks;
+                    ($action)(&mut *handler);
+                    hooks = std::mem::take(&mut $list.hooks);
+                    if hooks[i].handler.is_some() {
+                        hooks[i].handler = Some(handler);
                     }
                 }
             }
-            debug_assert!($list.hooks.is_empty());
             $list.hooks = hooks;
         }
     }};
@@ -1125,15 +1137,25 @@ impl Mmu {
 
         if perm != perm::NONE && ENABLE_MEMORY_HOOKS && !self.read_hooks.hooks.is_empty() {
             let mut hooks = std::mem::take(&mut self.read_hooks.hooks);
-            for hook in &mut hooks {
-                if let Some(handler) = hook.handler.as_mut() {
-                    if hook.start <= addr && addr < hook.end {
-                        if let Some(result) = handler.read(self, addr, N as u8) {
-                            let mut buf = [0; N];
-                            buf.copy_from_slice(&result.to_le_bytes()[..N]);
-                            self.read_hooks.hooks = hooks;
-                            return Ok(buf);
-                        }
+            let original_len = hooks.len();
+            for i in 0..original_len {
+                let hook = &mut hooks[i];
+                if hook.handler.is_some() && hook.start <= addr && addr < hook.end {
+                    // Temporarily take the handler out to avoid borrow conflicts.
+                    let mut handler = hook.handler.replace(Box::new(())).unwrap();
+                    // Put the hooks back so add_read_hook/remove_read_hook
+                    // operate on the full list with correct indices.
+                    self.read_hooks.hooks = hooks;
+                    let result = handler.read(self, addr, N as u8);
+                    hooks = std::mem::take(&mut self.read_hooks.hooks);
+                    if hooks[i].handler.is_some() {
+                        hooks[i].handler = Some(handler);
+                    }
+                    if let Some(result) = result {
+                        let mut buf = [0; N];
+                        buf.copy_from_slice(&result.to_le_bytes()[..N]);
+                        self.read_hooks.hooks = hooks;
+                        return Ok(buf);
                     }
                 }
             }
